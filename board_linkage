@@ -1,0 +1,165 @@
+# -*- coding: utf-8 -*-
+"""
+Created on Wed Apr  6 09:59:53 2022
+
+@author: yulong.shi
+"""
+import pandas as pd
+import numpy as np
+from tqdm import tqdm
+from pytdx.hq import TdxHq_API
+pd.set_option('mode.chained_assignment', None)
+
+api = TdxHq_API()
+tdx_ip="180.153.18.170"
+tdx_port=7709
+
+#导入文件/归类数据(stock -> block)
+filename = "C:\\Users\\58252\\Desktop\\windbk.xlsx"
+block = pd.read_excel(filename)
+
+#数据清洗
+block.drop(index=[len(block)-1, len(block)-2], inplace=True) #去掉最后两行无关数据
+stock_code = block.pop('证券代码') #弹出全部证券代码
+stock_name = block.pop('证券简称') #弹出全部证券简称
+stock_block_info = block['所属概念板块'].str.split(";",expand=True) #拆分所属概念板块里的全部板块
+stock_block_info.insert(0,'证券代码',stock_code) #重新插入全部证券代码
+stock_block_info.insert(1,'证券简称',stock_name) #重新插入全部证券简称
+
+#筛选BJ股票
+bj_code = []
+for i in range(len(stock_block_info)):
+    if 'BJ' in stock_code[i]:
+        bj_code.append(i)
+
+#筛选ST股票
+st_code = []
+for i in range(len(stock_block_info)):
+    if 'ST' in stock_name[i]:
+        st_code.append(i)
+
+#去掉BJ和ST的股票
+stock_block_info.drop(index=bj_code, inplace=True)
+stock_block_info.drop(index=st_code, inplace=True)
+stock_block_info.reset_index(inplace=True)
+del stock_block_info['index']
+
+#计算前300天证券收益率
+stock_change_pct = {}
+with api.connect(tdx_ip, tdx_port):
+    for code in tqdm(stock_block_info['证券代码']):
+        stock = code[:6]
+        market = 0 if 'SZ' in code else 1
+        price = api.to_df(api.get_security_bars(9, market, stock, 0, 300))['close']
+        close = api.to_df(api.get_security_bars(9, market, stock, 1, 300))['close']
+        change_pct = list((price/close)*100-100)
+        stock_change_pct[code] = change_pct
+
+#去掉缺失证券股票
+lost_code = []
+for i in range(len(stock_block_info)):
+    code = stock_block_info['证券代码'][i]
+    if len(stock_change_pct[code]) != 300:
+        stock_change_pct.pop(code)
+        lost_code.append(i)
+stock_block_info.drop(index=lost_code, inplace=True)
+stock_block_info.reset_index(inplace=True)
+del stock_block_info['index']       
+
+#获取用来分析的证券代码和证券简称
+stock_code = stock_block_info['证券代码']
+stock_name = stock_block_info['证券简称']
+del stock_block_info['证券简称']
+stock_block_info.set_index('证券代码', inplace=True)
+
+#获取全部筛选后的板块
+block_stock_info = {}
+block_info = stock_block_info.copy(deep=True)
+block_info.reset_index(inplace=True)
+del block_info['证券代码']
+block_info = pd.concat(block_info.iloc[:,i] for i in range(block_info.shape[1]))
+block_info.dropna(inplace=True)
+block_info = block_info.drop_duplicates(keep='first')
+block_info.index = np.arange(len(block_info))
+
+#对应板块内存在的股票
+n_col = stock_block_info.shape[1]
+for bk in tqdm(block_info):
+    code = []
+    for row in stock_block_info.index:
+        for col in range(n_col):
+            if bk == stock_block_info.loc[row,col]:
+                code.append(row)
+    block_stock_info[bk] = code
+
+#计算前300天板块收益率(板块内全部证券等权收益率和)
+block_change_pct = {}
+for bk in tqdm(block_info):
+    df = pd.DataFrame(index=range(300))
+    for code in block_stock_info[bk]:
+        df[code] = stock_change_pct[code]
+    block_change_pct[bk] = list(df.mean(1))
+
+#计算股票和所属板块对应的变异系数，并比较其差的绝对值
+def cv(series):
+    mean = np.mean(series)
+    std = np.std(series)
+    return (mean/std)*100
+stock_block_cov = pd.DataFrame(index=stock_code, columns=block_info)
+n_col = stock_block_info.shape[1]
+for code in tqdm(stock_block_info.index):
+    for col in range(n_col):
+        if stock_block_info.loc[code,col] == None:
+            continue
+        bk = stock_block_info.loc[code,col]
+        abs_cv = abs(cv(stock_change_pct[code]) - cv(block_change_pct[bk]))
+        stock_block_cov.loc[code][bk] = abs_cv
+
+#获取变异系数差的绝对值从小到大排列的板块
+df = stock_block_cov.copy(deep=True)
+df.reset_index(inplace=True)
+block_linkage = pd.DataFrame(columns=['证券代码','证券简称','板块'])
+del df['证券代码']
+for i in tqdm(df.index):
+    row = df.loc[i]
+    row.dropna(inplace=True)
+    if row.empty:
+        continue
+    row.sort_values(inplace=True)
+    bk=[]
+    for j in row.index:
+        bk.append(j)
+        bk_new = ";" .join(bk)
+    block_linkage.loc[len(block_linkage)] = [stock_code[i], stock_name[i], bk_new]
+#block_linkage = block_linkage['板块'].str.split(";",expand=True)
+
+#取最小的两个
+df = stock_block_cov.copy(deep=True)
+df.reset_index(inplace=True)
+block_linkage = pd.DataFrame(columns=['证券代码','证券简称','板块1', '板块2'])
+del df['证券代码']
+for i in tqdm(df.index):
+    row = df.loc[i]
+    row.dropna(inplace=True)
+    if row.empty:
+        continue
+    row.sort_values(inplace=True)
+    block_linkage.loc[len(block_linkage)] = [stock_code[i], stock_name[i], row.index[0], row.index[1]]
+
+
+#统计板块对应出现频率
+bk = pd.DataFrame(block_linkage[['板块1','板块2']], columns=['板块1','板块2'])
+bk_alz = pd.DataFrame([[block_linkage['板块1'][0],block_linkage['板块2'][0],1]], 
+                              columns=['板块1','板块2','次数'])
+for i in tqdm(range(1,len(block_linkage))):
+    for j in range(len(bk_alz)):
+        if (bk_alz['板块1'][j] == block_linkage['板块1'][i] and bk_alz['板块2'][j] == block_linkage['板块2'][i]) or (bk_alz['板块2'][j] == block_linkage['板块1'][i] and bk_alz['板块1'][j] == block_linkage['板块2'][i]):
+            bk_alz['次数'][j] = bk_alz['次数'][j] + 1
+            break
+        elif j == len(bk_alz) - 1:
+            bk_alz.loc[len(bk_alz)] = [block_linkage['板块1'][i], block_linkage['板块2'][i], 1]
+bk_alz.sort_values("次数", ascending=False, inplace=True)           
+
+block_linkage.to_excel('C:\\Users\\58252\\Desktop\\板块联动匹配（300天）5.25.xlsx', index=False, encoding='utf_8_sig')
+stock_block_cov.to_excel('C:\\Users\\58252\\Desktop\\个股板块变异系数5.25.xlsx', index=False, encoding='utf_8_sig')
+bk_alz.to_csv('C:\\Users\\58252\\Desktop\\板块联动频率5.25.csv', index=False, encoding='utf_8_sig')
